@@ -17,13 +17,13 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
-from app.config import get_settings
-from app.database import DatabaseManager
-from app.exceptions import AppException, ValidationError, NotFoundError, DatabaseError
-from app.middleware import RequestLoggingMiddleware, ErrorHandlingMiddleware
-from app.models import User, UserCreate, UserUpdate, UserResponse
-from app.services import UserService
-from app.utils import setup_logging
+from config import get_settings
+from database import DatabaseManager
+from exceptions import AppException, ValidationError, NotFoundError, DatabaseError
+from middleware import RequestLoggingMiddleware, ErrorHandlingMiddleware
+from models import User, UserCreate, UserUpdate, UserResponse
+from services import UserService
+from utils import setup_logging
 
 # Initialize settings and logging
 settings = get_settings()
@@ -90,8 +90,6 @@ app = FastAPI(
 
 # Add rate limiting
 app.state.limiter = limiter
-from fastapi.requests import Request
-from fastapi.responses import Response
 
 def rate_limit_exceeded_handler(request: Request, exc: Exception) -> Response:
     return _rate_limit_exceeded_handler(request, exc)  # type: ignore
@@ -160,6 +158,8 @@ async def create_user(
     """Create a new user with rate limiting."""
     try:
         user = await user_service.create_user(user_data)
+        if not user:
+            raise DatabaseError("Failed to create user")
         logger.info(f"User created: {user.id}")
         return UserResponse.model_validate(user)
     except ValidationError as e:

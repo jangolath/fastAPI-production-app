@@ -6,7 +6,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://postgres:password@db:5432/myapp
+      - DATABASE_URL=postgresql://postgres:cu+eP@nda12@db:5432/myapp
       - REDIS_URL=redis://redis:6379
     depends_on:
       - db
@@ -16,11 +16,11 @@ services:
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
   db:
-    image: postgres:15
+    image: postgres:17
     environment:
       - POSTGRES_DB=myapp
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=password
+      - POSTGRES_PASSWORD=cu+eP@nda12
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:

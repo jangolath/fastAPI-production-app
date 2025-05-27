@@ -4,8 +4,8 @@ from typing import List, Optional
 
 import asyncpg
 
-from app.exceptions import ValidationError, DatabaseError
-from app.models import User, UserCreate, UserUpdate
+from exceptions import ValidationError, DatabaseError
+from models import User, UserCreate, UserUpdate
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +16,7 @@ class UserService:
     def __init__(self, db: asyncpg.Connection):
         self.db = db
     
-    async def create_user(self, user_data: UserCreate) -> User:
+    async def create_user(self, user_data: UserCreate) -> Optional[User]:
         """Create a new user."""
         try:
             # Check if user already exists
@@ -36,9 +36,7 @@ class UserService:
                 user_data.email, user_data.name, user_data.is_active
             )
             
-            if row is None:
-                raise DatabaseError("Failed to insert user into database")
-            return User(**{k: row[k] for k in row.keys()})
+            return User(**dict(row)) if row else None
             
         except ValidationError:
             raise

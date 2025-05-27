@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 
 import asyncpg
 import uvicorn
-from fastapi import FastAPI, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, HTTPException, Depends, Request, Response, Query  # Added Query import
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
@@ -190,7 +190,7 @@ async def get_user(
 async def list_users(
     request: Request,
     skip: int = 0,
-    limit: int = Field(default=10, le=100),
+    limit: int = Query(default=10, le=100),  # Fixed: Changed Field to Query
     user_service: UserService = Depends(get_user_service)
 ):
     """List users with pagination and rate limiting."""

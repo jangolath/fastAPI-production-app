@@ -6,7 +6,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://postgres:cu+eP@nda12@db:5432/myapp
+      - DATABASE_URL=postgresql://postgres:mypassword123@db:5432/myapp
       - REDIS_URL=redis://redis:6379
     depends_on:
       - db
@@ -20,7 +20,7 @@ services:
     environment:
       - POSTGRES_DB=myapp
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=cu+eP@nda12
+      - POSTGRES_PASSWORD=mypassword123
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:

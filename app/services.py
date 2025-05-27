@@ -36,7 +36,9 @@ class UserService:
                 user_data.email, user_data.name, user_data.is_active
             )
             
-            return User(**dict(row))
+            if row is None:
+                raise DatabaseError("Failed to insert user into database")
+            return User(**{k: row[k] for k in row.keys()})
             
         except ValidationError:
             raise

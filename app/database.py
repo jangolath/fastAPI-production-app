@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 import asyncpg
 from asyncpg import Pool
@@ -37,6 +37,8 @@ class DatabaseManager:
     
     async def _create_tables(self):
         """Create database tables."""
+        if not self._pool:
+            raise RuntimeError("Database pool not initialized")
         async with self._pool.acquire() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (

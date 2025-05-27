@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     allowed_hosts: List[str] = Field(default=["*"], env="ALLOWED_HOSTS")
     
     # Database settings
-    database_url: str = Field(env="DATABASE_URL", default="postgresql://user:password@localhost/dbname")
+    database_url: str = Field(env="DATABASE_URL", default="postgresql://postgres:cu+eP@nda12@localhost/dbname")
     database_pool_min: int = Field(default=10, env="DB_POOL_MIN")
     database_pool_max: int = Field(default=20, env="DB_POOL_MAX")
     

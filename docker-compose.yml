@@ -45,5 +45,29 @@ services:
       - "6379:6379"
     restart: unless-stopped
 
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin-web
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@example.com
+      - PGADMIN_DEFAULT_PASSWORD=admin123
+      - PGADMIN_CONFIG_SERVER_MODE=False
+      # Optional customizations:
+      - PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION=True
+      - PGADMIN_CONFIG_LOGIN_BANNER="FastAPI Development Database"
+      - PGADMIN_CONFIG_CONSOLE_LOG_LEVEL=10
+      # Pre-configure server connection (advanced)
+      - PGADMIN_CONFIG_WTF_CSRF_TIME_LIMIT=None
+    ports:
+      - "8080:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgladmin
+      # Optional: Mount a servers.json for pre-configured connections
+      # - ./pgadmin/servers.json:/pgadmin4/servers.json
+    depends_on:
+      - db
+    restart: unless-stopped
+
 volumes:
   postgres_data:
+  pgadmin_data:

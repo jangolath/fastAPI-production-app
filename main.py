@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 limiter = Limiter(key_func=get_remote_address)
 
 # Database manager instance
-db_manager = DatabaseManager()
+db_manager = DatabaseManager(database_url=settings.database_url)
 
 # Security
 security = HTTPBearer()

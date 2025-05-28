@@ -1,35 +1,49 @@
-version: '3.8'
-
 services:
   app:
     build: .
+    container_name: fastapi-app
     ports:
       - "8000:8000"
     environment:
       - DATABASE_URL=postgresql://postgres:mypassword123@db:5432/myapp
       - REDIS_URL=redis://redis:6379
-    depends_on:
-      - db
-      - redis
+      - DEBUG=true
+      - LOG_LEVEL=INFO
     volumes:
       - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
   db:
     image: postgres:17
+    container_name: postgres-db
     environment:
       - POSTGRES_DB=myapp
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=mypassword123
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d myapp"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
 
   redis:
-    image: redis:7
+    image: redis:7-alpine
+    container_name: redis-cache
     ports:
       - "6379:6379"
+    restart: unless-stopped
 
 volumes:
   postgres_data:

@@ -29,6 +29,12 @@ class Settings(BaseSettings):
         description="Redis connection URL"
     )
     
+    # RabbitMQ settings (for message queuing)
+    rabbitmq_url: str = Field(
+        default="amqp://user:password@localhost:5672/",
+        description="RabbitMQ connection URL"
+    )
+    
     # Security settings
     secret_key: str = Field(
         default="your-secret-key-here-change-in-production",

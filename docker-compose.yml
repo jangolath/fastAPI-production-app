@@ -7,6 +7,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://postgres:mypassword123@db:5432/myapp
       - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://user:password@rabbitmq:5672/
       - DEBUG=true
       - LOG_LEVEL=INFO
     volumes:
@@ -16,6 +17,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+      rabbitmq:
+        condition: service_healthy
     restart: unless-stopped
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
@@ -45,6 +48,69 @@ services:
       - "6379:6379"
     restart: unless-stopped
 
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: rabbitmq-broker
+    environment:
+      - RABBITMQ_DEFAULT_USER=user
+      - RABBITMQ_DEFAULT_PASS=password
+      - RABBITMQ_DEFAULT_VHOST=/
+    ports:
+      - "5672:5672"      # AMQP port
+      - "15672:15672"    # Management UI port
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: rabbitmq-diagnostics check_port_connectivity
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # Background workers for processing RabbitMQ messages
+  worker-notifications:
+    build: .
+    container_name: worker-notifications
+    environment:
+      - DATABASE_URL=postgresql://postgres:mypassword123@db:5432/myapp
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://user:password@rabbitmq:5672/
+      - WORKER_TYPE=notifications
+      - LOG_LEVEL=INFO
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    command: python worker.py notifications
+
+  worker-processing:
+    build: .
+    container_name: worker-processing
+    environment:
+      - DATABASE_URL=postgresql://postgres:mypassword123@db:5432/myapp
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://user:password@rabbitmq:5672/
+      - WORKER_TYPE=processing
+      - LOG_LEVEL=INFO
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    command: python worker.py processing
+
   pgadmin:
     image: dpage/pgadmin4:latest
     container_name: pgadmin-web
@@ -52,18 +118,14 @@ services:
       - PGADMIN_DEFAULT_EMAIL=admin@example.com
       - PGADMIN_DEFAULT_PASSWORD=admin123
       - PGADMIN_CONFIG_SERVER_MODE=False
-      # Optional customizations:
       - PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION=True
       - PGADMIN_CONFIG_LOGIN_BANNER="FastAPI Development Database"
       - PGADMIN_CONFIG_CONSOLE_LOG_LEVEL=10
-      # Pre-configure server connection (advanced)
       - PGADMIN_CONFIG_WTF_CSRF_TIME_LIMIT=None
     ports:
       - "8080:80"
     volumes:
-      - pgadmin_data:/var/lib/pgladmin
-      # Optional: Mount a servers.json for pre-configured connections
-      # - ./pgadmin/servers.json:/pgadmin4/servers.json
+      - pgadmin_data:/var/lib/pgadmin
     depends_on:
       - db
     restart: unless-stopped
@@ -71,3 +133,4 @@ services:
 volumes:
   postgres_data:
   pgadmin_data:
+  rabbitmq_data:

@@ -18,6 +18,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
+from rabbitmq_service import RabbitMQService, MessagePriority, MessageHelpers
 
 from config import get_settings
 from database import DatabaseManager
@@ -39,6 +40,7 @@ limiter = Limiter(key_func=get_remote_address)
 # Database and Redis manager instances
 db_manager = DatabaseManager(database_url=settings.database_url)
 redis_service = RedisService(redis_url=settings.redis_url)
+rabbitmq_service = RabbitMQService(rabbitmq_url=settings.rabbitmq_url)
 
 # Security
 security = HTTPBearer()
@@ -74,6 +76,42 @@ class LeaderboardEntry(BaseModel):
     score: float
     rank: int
 
+class NotificationRequest(BaseModel):
+    """Notification request model."""
+    user_id: int
+    type: str = Field(..., description="notification, email, or sms")
+    title: str
+    message: str
+    priority: str = Field(default="normal", description="low, normal, high, urgent")
+
+class ProcessingJobRequest(BaseModel):
+    """Processing job request model."""
+    job_type: str = Field(..., description="user_analytics, data_export, or cleanup")
+    user_id: Optional[int] = None
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    delay_seconds: int = Field(default=0, description="Delay before processing")
+    priority: str = Field(default="normal", description="low, normal, high, urgent")
+
+class BatchOperationRequest(BaseModel):
+    """Batch operation request model."""
+    operation: str = Field(..., description="bulk_update, bulk_delete, or bulk_export")
+    items: List[Dict[str, Any]]
+    priority: str = Field(default="normal")
+
+class ReportRequest(BaseModel):
+    """Report generation request model."""
+    report_type: str = Field(..., description="user_activity, system_stats, or custom")
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    format: str = Field(default="pdf", description="pdf, excel, or csv")
+    priority: str = Field(default="normal")
+
+class MessageStatus(BaseModel):
+    """Message status model."""
+    message_id: str
+    status: str
+    queue: str
+    published_at: datetime
+    priority: int
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -82,6 +120,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up application...")
     await db_manager.initialize()
     await redis_service.initialize()
+    await rabbitmq_service.initialize()
     
     # Background task example
     background_task = asyncio.create_task(background_worker())
@@ -98,6 +137,7 @@ async def lifespan(app: FastAPI):
             pass
         await db_manager.close()
         await redis_service.close()
+        await rabbitmq_service.close()
 
 
 async def background_worker():
@@ -174,6 +214,9 @@ async def get_user_service(db=Depends(get_db)) -> UserService:
     """User service dependency."""
     return UserService(db)
 
+async def get_rabbitmq() -> RabbitMQService:
+    """RabbitMQ dependency."""
+    return rabbitmq_service
 
 # Middleware for API call counting
 @app.middleware("http")
@@ -242,6 +285,18 @@ async def create_user(
         user = await user_service.create_user(user_data)
         if not user:
             raise DatabaseError("Failed to create user")
+        
+        # Publish user created event
+        await rabbitmq_service.publish_user_event(
+            "user_created",
+            user.id,
+            {
+                "email": user.email,
+                "name": user.name,
+                "created_at": user.created_at.isoformat()
+            },
+            priority=MessagePriority.NORMAL
+        )
         
         # Cache the new user
         cache_key = RedisKeys.user_cache(user.id)
@@ -807,6 +862,474 @@ async def process_user_data(
     except Exception as e:
         logger.error(f"Processing failed for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail="Processing failed")
+
+# ============== RABBITMQ ENDPOINTS ==============
+
+@app.get("/health/rabbitmq", tags=["Health"])
+async def rabbitmq_health_check(rabbitmq: RabbitMQService = Depends(get_rabbitmq)):
+    """RabbitMQ health check."""
+    try:
+        queues_info = await rabbitmq.get_all_queues_info()
+        return {
+            "status": "healthy", 
+            "rabbitmq": "connected",
+            "queues": queues_info["total_queues"]
+        }
+    except Exception as e:
+        logger.error(f"RabbitMQ health check failed: {e}")
+        raise HTTPException(status_code=503, detail="RabbitMQ unavailable")
+
+@app.post("/notifications/send", tags=["RabbitMQ Demo"])
+@limiter.limit("20/minute")
+async def send_notification(
+    request: Request,
+    notification: NotificationRequest,
+    rabbitmq: RabbitMQService = Depends(get_rabbitmq),
+    redis: RedisService = Depends(get_redis)
+):
+    """Send notification via message queue."""
+    try:
+        # Convert priority string to enum
+        priority_map = {
+            "low": MessagePriority.LOW,
+            "normal": MessagePriority.NORMAL,
+            "high": MessagePriority.HIGH,
+            "urgent": MessagePriority.URGENT
+        }
+        priority = priority_map.get(notification.priority, MessagePriority.NORMAL)
+        
+        # Publish notification message
+        success = await rabbitmq.publish_notification(
+            notification.type,
+            notification.user_id,
+            {
+                "title": notification.title,
+                "message": notification.message,
+                "sent_by": "api"
+            },
+            priority=priority
+        )
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to queue notification")
+        
+        # Track notification in Redis
+        await redis.increment_counter(f"notifications:queued:{notification.type}")
+        
+        return {
+            "message": "Notification queued successfully",
+            "user_id": notification.user_id,
+            "type": notification.type,
+            "priority": notification.priority,
+            "estimated_processing": "1-30 seconds"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to queue notification: {e}")
+        raise HTTPException(status_code=500, detail="Failed to queue notification")
+
+@app.post("/jobs/processing", tags=["RabbitMQ Demo"])
+@limiter.limit("10/minute")
+async def queue_processing_job(
+    request: Request,
+    job: ProcessingJobRequest,
+    rabbitmq: RabbitMQService = Depends(get_rabbitmq),
+    redis: RedisService = Depends(get_redis)
+):
+    """Queue a data processing job."""
+    try:
+        priority_map = {
+            "low": MessagePriority.LOW,
+            "normal": MessagePriority.NORMAL,
+            "high": MessagePriority.HIGH,
+            "urgent": MessagePriority.URGENT
+        }
+        priority = priority_map.get(job.priority, MessagePriority.NORMAL)
+        
+        # Publish processing job
+        success = await rabbitmq.publish_processing_job(
+            job.job_type,
+            {
+                "user_id": job.user_id,
+                "parameters": job.parameters,
+                "requested_by": "api"
+            },
+            priority=priority,
+            delay_seconds=job.delay_seconds
+        )
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to queue job")
+        
+        # Track job in Redis
+        await redis.increment_counter(f"jobs:queued:{job.job_type}")
+        
+        return {
+            "message": "Processing job queued successfully",
+            "job_type": job.job_type,
+            "priority": job.priority,
+            "delay_seconds": job.delay_seconds,
+            "estimated_processing": "2-10 minutes"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to queue processing job: {e}")
+        raise HTTPException(status_code=500, detail="Failed to queue processing job")
+
+@app.post("/jobs/batch", tags=["RabbitMQ Demo"])
+@limiter.limit("5/minute")
+async def queue_batch_operation(
+    request: Request,
+    batch_job: BatchOperationRequest,
+    rabbitmq: RabbitMQService = Depends(get_rabbitmq),
+    redis: RedisService = Depends(get_redis)
+):
+    """Queue a batch operation."""
+    try:
+        if len(batch_job.items) > 1000:
+            raise HTTPException(status_code=400, detail="Max 1000 items per batch")
+        
+        priority_map = {
+            "low": MessagePriority.LOW,
+            "normal": MessagePriority.NORMAL,
+            "high": MessagePriority.HIGH,
+            "urgent": MessagePriority.URGENT
+        }
+        priority = priority_map.get(batch_job.priority, MessagePriority.NORMAL)
+        
+        # Create batch job message
+        batch_message = MessageHelpers.create_batch_operation_job(
+            batch_job.operation,
+            batch_job.items
+        )
+        
+        # Publish batch operation
+        success = await rabbitmq.publish_message(
+            "processing",
+            "batch.operation",
+            batch_message,
+            priority=priority
+        )
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to queue batch operation")
+        
+        # Track batch job in Redis
+        await redis.increment_counter(f"batch:queued:{batch_job.operation}")
+        
+        return {
+            "message": "Batch operation queued successfully",
+            "operation": batch_job.operation,
+            "items_count": len(batch_job.items),
+            "priority": batch_job.priority,
+            "estimated_processing": f"{len(batch_job.items) // 10 + 1}-{len(batch_job.items) // 5 + 2} minutes"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to queue batch operation: {e}")
+        raise HTTPException(status_code=500, detail="Failed to queue batch operation")
+
+@app.post("/reports/generate", tags=["RabbitMQ Demo"])
+@limiter.limit("3/minute")
+async def generate_report(
+    request: Request,
+    report: ReportRequest,
+    rabbitmq: RabbitMQService = Depends(get_rabbitmq),
+    redis: RedisService = Depends(get_redis),
+    user_service: UserService = Depends(get_user_service)
+):
+    """Generate a report via message queue."""
+    try:
+        priority_map = {
+            "low": MessagePriority.LOW,
+            "normal": MessagePriority.NORMAL,
+            "high": MessagePriority.HIGH,
+            "urgent": MessagePriority.URGENT
+        }
+        priority = priority_map.get(report.priority, MessagePriority.NORMAL)
+        
+        # Create report generation job
+        report_message = MessageHelpers.create_report_generation_job(
+            report.report_type,
+            {**report.parameters, "format": report.format},
+            1  # Mock user ID
+        )
+        
+        # Publish report generation job
+        success = await rabbitmq.publish_message(
+            "processing",
+            "report.generate",
+            report_message,
+            priority=priority
+        )
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to queue report generation")
+        
+        # Track report request in Redis
+        await redis.increment_counter(f"reports:queued:{report.report_type}")
+        
+        return {
+            "message": "Report generation queued successfully",
+            "report_type": report.report_type,
+            "format": report.format,
+            "priority": report.priority,
+            "estimated_completion": "5-15 minutes"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to queue report generation: {e}")
+        raise HTTPException(status_code=500, detail="Failed to queue report generation")
+
+@app.get("/queues/status", tags=["RabbitMQ Demo"])
+async def get_queue_status(rabbitmq: RabbitMQService = Depends(get_rabbitmq)):
+    """Get status of all queues."""
+    try:
+        queues_info = await rabbitmq.get_all_queues_info()
+        return queues_info
+        
+    except Exception as e:
+        logger.error(f"Failed to get queue status: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get queue status")
+
+@app.get("/workers/stats", tags=["RabbitMQ Demo"])
+async def get_worker_stats(redis: RedisService = Depends(get_redis)):
+    """Get worker processing statistics."""
+    try:
+        # Get processing stats
+        stats = {
+            "notifications": {
+                "processed": await redis.get_counter("worker:notifications:processed"),
+                "failed": await redis.get_counter("worker:notifications:failed"),
+                "queued": await redis.get_counter("notifications:queued:user") + 
+                         await redis.get_counter("notifications:queued:email") +
+                         await redis.get_counter("notifications:queued:sms")
+            },
+            "processing_jobs": {
+                "completed": await redis.get_counter("worker:processing:completed"),
+                "failed": await redis.get_counter("worker:processing:failed"),
+                "queued": await redis.get_counter("jobs:queued:user_analytics") +
+                         await redis.get_counter("jobs:queued:data_export") +
+                         await redis.get_counter("jobs:queued:cleanup")
+            },
+            "batch_operations": {
+                "completed": await redis.get_counter("worker:batch:completed"),
+                "failed": await redis.get_counter("worker:batch:failed"),
+                "queued": await redis.get_counter("batch:queued:bulk_update") +
+                         await redis.get_counter("batch:queued:bulk_delete") +
+                         await redis.get_counter("batch:queued:bulk_export")
+            },
+            "reports": {
+                "generated": await redis.get_counter("worker:reports:generated"),
+                "failed": await redis.get_counter("worker:reports:failed"),
+                "queued": await redis.get_counter("reports:queued:user_activity") +
+                         await redis.get_counter("reports:queued:system_stats") +
+                         await redis.get_counter("reports:queued:custom")
+            },
+            "emails": {
+                "sent": await redis.get_counter("emails:sent:total"),
+                "failed": await redis.get_counter("worker:emails:failed")
+            }
+        }
+        
+        # Calculate success rates
+        for category in stats:
+            if category == "emails":
+                total = stats[category]["sent"] + stats[category]["failed"]
+                stats[category]["success_rate"] = (stats[category]["sent"] / total * 100) if total > 0 else 0
+            else:
+                completed = stats[category].get("completed", stats[category].get("processed", stats[category].get("generated", 0)))
+                failed = stats[category]["failed"]
+                total = completed + failed
+                stats[category]["success_rate"] = (completed / total * 100) if total > 0 else 0
+        
+        return {"worker_statistics": stats, "timestamp": datetime.utcnow().isoformat()}
+        
+    except Exception as e:
+        logger.error(f"Failed to get worker stats: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get worker stats")
+
+@app.get("/jobs/progress/{job_id}", tags=["RabbitMQ Demo"])
+async def get_job_progress(
+    job_id: str,
+    redis: RedisService = Depends(get_redis)
+):
+    """Get progress of a specific job."""
+    try:
+        # Check different progress types
+        batch_progress = await redis.get_cache(f"batch:progress:{job_id}")
+        report_progress = await redis.get_cache(f"report:progress:{job_id}")
+        
+        if batch_progress:
+            return {"job_id": job_id, "type": "batch", "progress": batch_progress}
+        elif report_progress:
+            return {"job_id": job_id, "type": "report", "progress": report_progress}
+        else:
+            raise HTTPException(status_code=404, detail="Job not found or completed")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get job progress: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get job progress")
+
+@app.get("/messages/history", tags=["RabbitMQ Demo"])
+async def get_message_history(
+    message_type: str = Query(..., description="notifications, jobs, emails, reports, events"),
+    limit: int = Query(default=50, le=1000),
+    redis: RedisService = Depends(get_redis)
+):
+    """Get message processing history."""
+    try:
+        history_key_map = {
+            "notifications": "user:notifications:*",
+            "emails": "emails:sent:history",
+            "jobs": "jobs:completed:history",
+            "reports": "reports:generated",
+            "events": "events:processed:history"
+        }
+        
+        if message_type not in history_key_map:
+            raise HTTPException(status_code=400, detail="Invalid message type")
+        
+        history_key = history_key_map[message_type]
+        
+        if message_type == "notifications":
+            # Get notification history from all users (simplified)
+            return {
+                "message": "Use /users/{user_id}/notifications for specific user notifications",
+                "available_types": ["emails", "jobs", "reports", "events"]
+            }
+        else:
+            # Get history from Redis list
+            history = await redis.get_list(history_key, 0, limit - 1)
+            
+        return {
+            "message_type": message_type,
+            "history": history,
+            "count": len(history)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get message history: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get message history")
+
+@app.get("/users/{user_id}/notifications", tags=["RabbitMQ Demo"])
+async def get_user_notifications(
+    user_id: int,
+    limit: int = Query(default=20, le=100),
+    redis: RedisService = Depends(get_redis)
+):
+    """Get user's notification history."""
+    try:
+        notifications = await redis.get_list(f"user:notifications:{user_id}", 0, limit - 1)
+        
+        return {
+            "user_id": user_id,
+            "notifications": notifications,
+            "count": len(notifications),
+            "total_notifications": await redis.get_list_length(f"user:notifications:{user_id}")
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get user notifications: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get user notifications")
+
+@app.post("/demo/rabbitmq", tags=["RabbitMQ Demo"])
+async def create_rabbitmq_demo_data(
+    rabbitmq: RabbitMQService = Depends(get_rabbitmq),
+    redis: RedisService = Depends(get_redis)
+):
+    """Create demo data to showcase RabbitMQ features."""
+    try:
+        demo_messages_sent = 0
+        
+        # Send demo notifications
+        notifications = [
+            {"type": "user", "user_id": 1, "title": "Welcome!", "message": "Welcome to our platform!", "priority": "high"},
+            {"type": "email", "user_id": 2, "title": "Newsletter", "message": "Check out our latest updates", "priority": "normal"},
+            {"type": "sms", "user_id": 3, "title": "Alert", "message": "Your account needs attention", "priority": "urgent"}
+        ]
+        
+        for notif in notifications:
+            success = await rabbitmq.publish_notification(
+                notif["type"], notif["user_id"], 
+                {"title": notif["title"], "message": notif["message"]},
+                getattr(MessagePriority, notif["priority"].upper())
+            )
+            if success:
+                demo_messages_sent += 1
+        
+        # Send demo processing jobs
+        jobs = [
+            {"job_type": "user_analytics", "user_id": 1, "priority": "normal"},
+            {"job_type": "data_export", "user_id": 2, "priority": "low"},
+            {"job_type": "cleanup", "priority": "high"}
+        ]
+        
+        for job in jobs:
+            success = await rabbitmq.publish_processing_job(
+                job["job_type"],
+                {"user_id": job.get("user_id"), "demo": True},
+                getattr(MessagePriority, job["priority"].upper())
+            )
+            if success:
+                demo_messages_sent += 1
+        
+        # Send demo batch operation
+        batch_items = [{"id": i, "action": "update", "data": {"field": f"value_{i}"}} for i in range(1, 6)]
+        batch_message = MessageHelpers.create_batch_operation_job("bulk_update", batch_items)
+        
+        success = await rabbitmq.publish_message("processing", "batch.operation", batch_message)
+        if success:
+            demo_messages_sent += 1
+        
+        # Send demo report generation
+        report_message = MessageHelpers.create_report_generation_job(
+            "user_activity", {"date_range": "last_30_days"}, 1
+        )
+        
+        success = await rabbitmq.publish_message("processing", "report.generate", report_message)
+        if success:
+            demo_messages_sent += 1
+        
+        # Send demo user events
+        events = [
+            {"user_id": 1, "event_type": "user_login", "data": {"ip": "192.168.1.1"}},
+            {"user_id": 2, "event_type": "profile_updated", "data": {"fields": ["name", "email"]}},
+            {"user_id": 3, "event_type": "purchase_completed", "data": {"amount": 99.99, "product": "Premium Plan"}}
+        ]
+        
+        for event in events:
+            success = await rabbitmq.publish_user_event(
+                event["event_type"], event["user_id"], event["data"]
+            )
+            if success:
+                demo_messages_sent += 1
+        
+        return {
+            "message": "RabbitMQ demo data created successfully",
+            "messages_sent": demo_messages_sent,
+            "tip": "Check the following endpoints to see the results:",
+            "endpoints": [
+                "GET /workers/stats - View worker statistics",
+                "GET /queues/status - View queue status",
+                "GET /messages/history?message_type=emails - View email history",
+                "GET /messages/history?message_type=jobs - View job history",
+                "GET /users/1/notifications - View user notifications",
+                "Workers will process these messages in the background!"
+            ],
+            "monitoring": [
+                "RabbitMQ Management UI: http://localhost:15672 (user/password)",
+                "Watch Docker logs: docker-compose logs -f worker-notifications worker-processing"
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to create RabbitMQ demo data: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create demo data")
 
 
 if __name__ == "__main__":
